@@ -51,13 +51,18 @@ class TabbyClient:
             **filtered_kwargs
         }
 
+        import logging
+        logger = logging.getLogger(__name__)
+        if logger.isEnabledFor(logging.DEBUG):
+            msgs = payload.get("messages", [])
+            logger.debug(f"Non-streaming payload last 2 messages: {msgs[-2:] if len(msgs) >= 2 else msgs}")
+            logger.debug(f"Non-streaming payload keys: {list(payload.keys())}")
+
         response = await self.client.post(
             f"{self.base_url}/v1/chat/completions",
             json=payload
         )
         if response.status_code != 200:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.error(f"Backend returned {response.status_code}: {response.text}")
             logger.error(f"Payload sent: {payload}")
         response.raise_for_status()
@@ -93,6 +98,10 @@ class TabbyClient:
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"Streaming to TabbyAPI - max_tokens: {payload.get('max_tokens')}, thinking: {payload.get('thinking')}")
+        if logger.isEnabledFor(logging.DEBUG):
+            msgs = payload.get("messages", [])
+            logger.debug(f"Payload last 2 messages: {msgs[-2:] if len(msgs) >= 2 else msgs}")
+            logger.debug(f"Full payload keys: {list(payload.keys())}")
 
         async with self.client.stream(
             "POST",

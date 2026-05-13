@@ -45,6 +45,32 @@ def is_minimax_model(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in settings.minimax_model_patterns)
 
 
+def strip_trailing_assistant_prefill(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove trailing whitespace-only assistant messages used as response prefills.
+
+    Some clients append {"role": "assistant", "content": ""} or "\n" to prime
+    generation. llama-server with enable_thinking rejects this with a 400.
+    Loops until no more strippable trailing assistant messages remain.
+    """
+    result = list(messages)
+    stripped = 0
+    while result:
+        last = result[-1]
+        if last.get("role") != "assistant":
+            break
+        if last.get("tool_calls"):
+            break
+        content = last.get("content", "")
+        if content is None or (isinstance(content, str) and not content.strip()):
+            result = result[:-1]
+            stripped += 1
+        else:
+            break
+    if stripped:
+        logger.debug(f"Stripped {stripped} trailing assistant prefill message(s)")
+    return result
+
+
 if settings.enable_streaming_debug:
     stream_logger.setLevel(logging.DEBUG)
     if settings.streaming_debug_path:
@@ -227,7 +253,7 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
             tools = [tool.model_dump(exclude_none=True) for tool in chat_request.tools]
 
         response = await tabby_client.chat_completion(
-            messages=messages,
+            messages=strip_trailing_assistant_prefill(messages),
             model=chat_request.model,
             max_tokens=chat_request.max_tokens,
             temperature=chat_request.temperature,
@@ -268,7 +294,7 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
     logger.info(f"Calling TabbyAPI with banned_strings enabled: {settings.enable_chinese_char_blocking}, count: {len(banned_strings) if banned_strings else 0}")
 
     response = await tabby_client.chat_completion(
-        messages=normalized_messages,
+        messages=strip_trailing_assistant_prefill(normalized_messages),
         model=chat_request.model,
         max_tokens=chat_request.max_tokens,
         temperature=chat_request.temperature,
@@ -380,7 +406,7 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
         try:
             async for line in tabby_client.chat_completion_stream(
-                messages=messages,
+                messages=strip_trailing_assistant_prefill(messages),
                 model=chat_request.model,
                 max_tokens=chat_request.max_tokens,
                 temperature=chat_request.temperature,
@@ -390,7 +416,7 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                 tools=tools,
                 tool_choice=chat_request.tool_choice,
             ):
-                yield line + "\n"
+                yield line + "\n\n"
         except Exception as e:
             logger.error(f"Error in OpenAI streaming (pass-through): {e}", exc_info=True)
             error_chunk = openai_formatter.format_error(str(e))
@@ -705,7 +731,7 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
     try:
         stream_gen = tabby_client.extract_streaming_content(
-            messages=normalized_messages,
+            messages=strip_trailing_assistant_prefill(normalized_messages),
             model=chat_request.model,
             max_tokens=chat_request.max_tokens,
             temperature=chat_request.temperature,
@@ -727,7 +753,22 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
         first_delta = first_chunk.get("choices", [{}])[0].get("delta", {})
         structured_mode = bool(first_delta.get("reasoning_content"))
 
-        chunk_iter = prepend_chunk(first_chunk, stream_gen)
+        # llama-server emits a role-announcement chunk first (content=null, no
+        # reasoning_content).  Peek at the second chunk so we don't mis-classify
+        # a model that uses reasoning_content as legacy mode.
+        if not structured_mode and not first_delta.get("content") and not first_delta.get("reasoning_content"):
+            try:
+                second_chunk = await stream_gen.__anext__()
+                second_delta = second_chunk.get("choices", [{}])[0].get("delta", {})
+                structured_mode = bool(second_delta.get("reasoning_content"))
+                logger.debug(f"Peeked second chunk for mode detection: structured_mode={structured_mode}")
+                chunk_iter = prepend_chunk(first_chunk, prepend_chunk(second_chunk, stream_gen))
+            except StopAsyncIteration:
+                chunk_iter = prepend_chunk(first_chunk, stream_gen)
+        else:
+            chunk_iter = prepend_chunk(first_chunk, stream_gen)
+
+        logger.debug(f"Streaming mode: {'structured' if structured_mode else 'legacy'}")
 
         if structured_mode:
             async for event in structured_stream(chunk_iter):
@@ -822,7 +863,7 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
         tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
 
         response = await tabby_client.chat_completion(
-            messages=openai_messages,
+            messages=strip_trailing_assistant_prefill(openai_messages),
             model=anthropic_request.model,
             max_tokens=effective_max_tokens,
             temperature=anthropic_request.temperature,
@@ -895,7 +936,7 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
 
     # Call TabbyAPI
     response = await tabby_client.chat_completion(
-        messages=normalized_messages,
+        messages=strip_trailing_assistant_prefill(normalized_messages),
         model=anthropic_request.model,
         max_tokens=effective_max_tokens,
         temperature=anthropic_request.temperature,
@@ -1051,7 +1092,7 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
             tool_calls_buffer: Dict[int, Dict[str, Any]] = {}
 
             async for chunk in tabby_client.extract_streaming_content(
-                messages=openai_messages,
+                messages=strip_trailing_assistant_prefill(openai_messages),
                 model=anthropic_request.model,
                 max_tokens=effective_max_tokens,
                 temperature=anthropic_request.temperature,
@@ -1182,7 +1223,7 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
 
         # Stream from TabbyAPI
         async for chunk in tabby_client.extract_streaming_content(
-            messages=normalized_messages,
+            messages=strip_trailing_assistant_prefill(normalized_messages),
             model=anthropic_request.model,
             max_tokens=effective_max_tokens,
             temperature=anthropic_request.temperature,
