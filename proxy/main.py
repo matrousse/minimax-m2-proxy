@@ -365,11 +365,20 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
 
     client_content = content_payload
 
+    backend_usage = response.get("usage")
+    if backend_usage and "prompt_tokens" not in backend_usage and "input_tokens" in backend_usage:
+        backend_usage = {
+            "prompt_tokens": backend_usage.get("input_tokens", 0),
+            "completion_tokens": backend_usage.get("output_tokens", 0),
+            "total_tokens": backend_usage.get("input_tokens", 0) + backend_usage.get("output_tokens", 0),
+        }
+
     formatted = openai_formatter.format_complete_response(
         content=client_content,
         tool_calls=tool_calls,
         model=chat_request.model,
         reasoning_text=thinking_text if reasoning_split else None,
+        usage=backend_usage,
     )
 
     if session_id:
@@ -471,6 +480,7 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
         think_closed = False
         tool_xml_emitted = False
         finished = False
+        backend_usage: Optional[Dict[str, Any]] = None
 
         def merge_tool_call_delta(delta_list: List[Dict[str, Any]]) -> None:
             for call in delta_list:
@@ -512,6 +522,8 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
             return ordered
 
         async for chunk in chunk_iter:
+            if chunk.get("usage"):
+                backend_usage = chunk["usage"]
             if not chunk.get("choices"):
                 continue
 
@@ -596,9 +608,11 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                 if final_finish_reason == "stop" and final_tool_calls:
                     final_finish_reason = "tool_calls"
 
+                backend_usage = backend_usage or chunk.get("usage")
                 yield openai_formatter.format_streaming_chunk(
                     finish_reason=final_finish_reason,
                     model=chat_request.model,
+                    usage=backend_usage,
                 )
                 finished = True
                 break
@@ -623,8 +637,11 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
         raw_segments: List[str] = []
         reasoning_segments: List[str] = []
         captured_tool_calls: Optional[List[Dict[str, Any]]] = None
+        backend_usage: Optional[Dict[str, Any]] = None
 
         async for chunk in chunk_iter:
+            if chunk.get("usage"):
+                backend_usage = chunk["usage"]
             if not chunk.get("choices"):
                 continue
 
@@ -697,9 +714,11 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                         )
                 if finish_reason == "stop" and streaming_parser.has_tool_calls():
                     finish_reason = "tool_calls"
+                backend_usage = backend_usage or chunk.get("usage")
                 yield openai_formatter.format_streaming_chunk(
                     finish_reason=finish_reason,
                     model=chat_request.model,
+                    usage=backend_usage,
                 )
                 break
 

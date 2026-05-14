@@ -16,6 +16,7 @@ class OpenAIFormatter:
         model: str = "minimax-m2",
         finish_reason: str = "stop",
         reasoning_text: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Format a complete (non-streaming) response.
@@ -54,7 +55,7 @@ class OpenAIFormatter:
                 "logprobs": None,
                 "finish_reason": finish_reason
             }],
-            "usage": {
+            "usage": usage or {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0
@@ -68,6 +69,7 @@ class OpenAIFormatter:
         finish_reason: Optional[str] = None,
         model: str = "minimax-m2",
         reasoning_delta: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Format a streaming chunk in Server-Sent Events format.
@@ -117,6 +119,9 @@ class OpenAIFormatter:
                 "finish_reason": finish_reason
             }]
         }
+
+        if usage is not None:
+            chunk["usage"] = usage
 
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 

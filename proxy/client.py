@@ -92,6 +92,7 @@ class TabbyClient:
             "model": model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             **filtered_kwargs
         }
 
@@ -134,7 +135,9 @@ class TabbyClient:
 
                 try:
                     chunk = json.loads(data_str)
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
+                    has_choices = bool(chunk.get("choices"))
+                    has_usage = chunk.get("usage") is not None
+                    if has_choices or has_usage:
                         yield chunk
                 except json.JSONDecodeError:
                     continue

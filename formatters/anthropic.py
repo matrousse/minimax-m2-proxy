@@ -177,13 +177,13 @@ class AnthropicFormatter:
         )
 
     @staticmethod
-    def format_message_delta(stop_reason: str = "end_turn", output_tokens: int = 0) -> str:
+    def format_message_delta(stop_reason: str = "end_turn", usage: Optional[Dict[str, Any]] = None) -> str:
         """Format message_delta event"""
         return AnthropicFormatter.format_streaming_event(
             "message_delta",
             {
                 "delta": {"stop_reason": stop_reason},
-                "usage": {"output_tokens": output_tokens}
+                "usage": usage or {"output_tokens": 0}
             }
         )
 
