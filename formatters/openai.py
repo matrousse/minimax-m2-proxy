@@ -69,6 +69,7 @@ class OpenAIFormatter:
         finish_reason: Optional[str] = None,
         model: str = "minimax-m2",
         reasoning_delta: Optional[str] = None,
+        reasoning_content: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
@@ -79,6 +80,8 @@ class OpenAIFormatter:
             tool_calls: Tool call deltas
             finish_reason: Set on final chunk
             model: Model name
+            reasoning_delta: Thinking text for reasoning_split mode (→ reasoning_details)
+            reasoning_content: Thinking text in native llama.cpp format (→ reasoning_content)
 
         Returns:
             SSE formatted string: "data: {json}\n\n"
@@ -92,6 +95,9 @@ class OpenAIFormatter:
             delta_content["reasoning_details"] = [
                 {"type": "chain_of_thought", "text": reasoning_delta}
             ]
+
+        if reasoning_content is not None:
+            delta_content["reasoning_content"] = reasoning_content
 
         if tool_calls is not None:
             normalized_calls = []

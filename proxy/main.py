@@ -481,6 +481,7 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
         tool_xml_emitted = False
         finished = False
         backend_usage: Optional[Dict[str, Any]] = None
+        pending_finish_reason: Optional[str] = None
 
         def merge_tool_call_delta(delta_list: List[Dict[str, Any]]) -> None:
             for call in delta_list:
@@ -535,12 +536,13 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
             finish_reason = choice.get("finish_reason")
 
             if reasoning_delta:
-                addition = reasoning_delta
+                # Track raw content with <think> tags for session history
+                raw_addition = reasoning_delta
                 if not think_started:
                     think_started = True
                     think_closed = False
-                    addition = f"<think>{addition}"
-                raw_segments.append(addition)
+                    raw_addition = f"<think>{raw_addition}"
+                raw_segments.append(raw_addition)
                 reasoning_segments.append(reasoning_delta)
                 if reasoning_split:
                     yield openai_formatter.format_streaming_chunk(
@@ -548,21 +550,18 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                         model=chat_request.model,
                     )
                 else:
+                    # Pass as native reasoning_content field so clients
+                    # (e.g. OpenCode llamacpp provider) can display thinking separately
                     yield openai_formatter.format_streaming_chunk(
-                        delta=addition,
+                        reasoning_content=reasoning_delta,
                         model=chat_request.model,
                     )
 
             if (not reasoning_delta) and think_started and not think_closed and (
                 content_delta or tool_delta or finish_reason
             ):
-                close_text = "</think>\n"
-                raw_segments.append(close_text)
-                if not reasoning_split:
-                    yield openai_formatter.format_streaming_chunk(
-                        delta=close_text,
-                        model=chat_request.model,
-                    )
+                raw_segments.append("</think>\n")
+                # No close chunk to send — reasoning_content stream simply stops
                 think_closed = True
 
             if content_delta:
@@ -582,13 +581,7 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
             if finish_reason:
                 if think_started and not think_closed:
-                    close_text = "</think>\n"
-                    raw_segments.append(close_text)
-                    if not reasoning_split:
-                        yield openai_formatter.format_streaming_chunk(
-                            delta=close_text,
-                            model=chat_request.model,
-                        )
+                    raw_segments.append("</think>\n")
                     think_closed = True
 
                 final_tool_list = finalize_tool_calls()
@@ -608,14 +601,9 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                 if final_finish_reason == "stop" and final_tool_calls:
                     final_finish_reason = "tool_calls"
 
-                backend_usage = backend_usage or chunk.get("usage")
-                yield openai_formatter.format_streaming_chunk(
-                    finish_reason=final_finish_reason,
-                    model=chat_request.model,
-                    usage=backend_usage,
-                )
+                pending_finish_reason = final_finish_reason
                 finished = True
-                break
+                # Don't break — keep draining for the usage-only chunk that follows
 
         if not finished:
             # No explicit finish_reason received; finalize with current buffers
@@ -626,8 +614,14 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
             tool_list = finalize_tool_calls()
             final_tool_calls = tool_list or None
 
-        async for _ in chunk_iter:
-            pass
+        # Emit finish chunk with real usage now that stream is fully drained
+        if pending_finish_reason is not None:
+            yield openai_formatter.format_streaming_chunk(
+                finish_reason=pending_finish_reason,
+                model=chat_request.model,
+                usage=backend_usage,
+            )
+        logger.info(f"OpenAI structured stream complete: finish={pending_finish_reason}, usage={backend_usage}")
 
     async def legacy_stream(chunk_iter: AsyncIterator[Dict[str, Any]]):
         nonlocal final_raw_content, final_reasoning_text, final_tool_calls
@@ -1109,6 +1103,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
             content_block_index = 0
             content_block_started = False
             tool_calls_buffer: Dict[int, Dict[str, Any]] = {}
+            backend_usage: Optional[Dict[str, Any]] = None
+            pending_stop_reason: Optional[str] = None
 
             async for chunk in tabby_client.extract_streaming_content(
                 messages=strip_trailing_assistant_prefill(openai_messages),
@@ -1121,62 +1117,81 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                 tools=tools,
                 tool_choice=tool_choice,
             ):
-                if "choices" in chunk and len(chunk["choices"]) > 0:
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
-                    content_delta = delta.get("content", "")
-                    tool_calls_delta = delta.get("tool_calls")
+                if chunk.get("usage"):
+                    backend_usage = chunk["usage"]
+                if not chunk.get("choices"):
+                    continue
 
-                    if content_delta:
-                        if not content_block_started:
-                            yield anthropic_formatter.format_content_block_start(content_block_index, "text")
-                            content_block_started = True
-                        yield anthropic_formatter.format_content_block_delta(
-                            content_block_index,
-                            content_delta,
-                            delta_type="text_delta"
-                        )
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {})
+                content_delta = delta.get("content", "")
+                tool_calls_delta = delta.get("tool_calls")
 
-                    if tool_calls_delta:
-                        # Buffer tool calls
-                        for tc_delta in tool_calls_delta:
-                            idx = tc_delta.get("index", 0)
-                            if idx not in tool_calls_buffer:
-                                tool_calls_buffer[idx] = {
-                                    "id": tc_delta.get("id", ""),
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""}
-                                }
-                            if "id" in tc_delta and tc_delta["id"]:
-                                tool_calls_buffer[idx]["id"] = tc_delta["id"]
-                            if "function" in tc_delta:
-                                fn = tc_delta["function"]
-                                if "name" in fn:
-                                    tool_calls_buffer[idx]["function"]["name"] = fn["name"]
-                                if "arguments" in fn:
-                                    tool_calls_buffer[idx]["function"]["arguments"] += fn["arguments"]
+                if content_delta:
+                    if not content_block_started:
+                        yield anthropic_formatter.format_content_block_start(content_block_index, "text")
+                        content_block_started = True
+                    yield anthropic_formatter.format_content_block_delta(
+                        content_block_index,
+                        content_delta,
+                        delta_type="text_delta"
+                    )
 
-                    finish_reason = choice.get("finish_reason")
-                    if finish_reason:
-                        # Close text block if open
-                        if content_block_started:
-                            yield anthropic_formatter.format_content_block_stop(content_block_index)
-                            content_block_index += 1
+                if tool_calls_delta:
+                    # Buffer tool calls
+                    for tc_delta in tool_calls_delta:
+                        idx = tc_delta.get("index", 0)
+                        if idx not in tool_calls_buffer:
+                            tool_calls_buffer[idx] = {
+                                "id": tc_delta.get("id", ""),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            }
+                        if "id" in tc_delta and tc_delta["id"]:
+                            tool_calls_buffer[idx]["id"] = tc_delta["id"]
+                        if "function" in tc_delta:
+                            fn = tc_delta["function"]
+                            if "name" in fn:
+                                tool_calls_buffer[idx]["function"]["name"] = fn["name"]
+                            if "arguments" in fn:
+                                tool_calls_buffer[idx]["function"]["arguments"] += fn["arguments"]
 
-                        # Send tool calls
-                        for idx in sorted(tool_calls_buffer.keys()):
-                            tool_call = tool_calls_buffer[idx]
-                            yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
-                            yield anthropic_formatter.format_content_block_stop(content_block_index)
-                            content_block_index += 1
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    # Close text block if open
+                    if content_block_started:
+                        yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        content_block_index += 1
 
-                        # Map finish reason
-                        stop_reason = "end_turn" if finish_reason == "stop" else finish_reason
-                        if finish_reason == "tool_calls":
-                            stop_reason = "tool_use"
+                    # Send tool calls
+                    for idx in sorted(tool_calls_buffer.keys()):
+                        tool_call = tool_calls_buffer[idx]
+                        yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
+                        yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        content_block_index += 1
 
-                        yield anthropic_formatter.format_message_delta(stop_reason)
-                        break
+                    # Map finish reason and defer message_delta until we have usage
+                    stop_reason = "end_turn" if finish_reason == "stop" else finish_reason
+                    if finish_reason == "tool_calls":
+                        stop_reason = "tool_use"
+                    pending_stop_reason = stop_reason
+                    # Don't break — keep draining for the usage-only chunk that follows
+
+            # Emit message_delta with real token counts now that the stream is drained
+            if pending_stop_reason is not None:
+                if backend_usage and "prompt_tokens" in backend_usage:
+                    anthropic_usage: Optional[Dict[str, Any]] = {
+                        "input_tokens": backend_usage.get("prompt_tokens", 0),
+                        "output_tokens": backend_usage.get("completion_tokens", 0),
+                    }
+                elif backend_usage:
+                    anthropic_usage = {
+                        "input_tokens": backend_usage.get("input_tokens", 0),
+                        "output_tokens": backend_usage.get("output_tokens", 0),
+                    }
+                else:
+                    anthropic_usage = None
+                yield anthropic_formatter.format_message_delta(pending_stop_reason, usage=anthropic_usage)
 
             yield anthropic_formatter.format_message_stop()
 
@@ -1221,6 +1236,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     captured_tool_calls: Optional[Dict[int, Dict[str, Any]]] = None
     thinking_block_started = False
     text_emitted = False
+    backend_usage: Optional[Dict[str, Any]] = None
+    pending_stop_reason: Optional[str] = None
     # Configure thinking tokens - always send for MiniMax to unlock full generation
     if anthropic_request.thinking:
         thinking_payload = anthropic_request.thinking
@@ -1255,44 +1272,60 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
             banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None,
             thinking=thinking_payload,
         ):
+            # Capture usage from any chunk (usage-only chunks have no choices)
+            if chunk.get("usage"):
+                backend_usage = chunk["usage"]
             # Extract delta
             if "choices" in chunk and len(chunk["choices"]) > 0:
                 choice = chunk["choices"][0]
                 delta = choice.get("delta", {})
-                reasoning_delta = delta.get("reasoning_content", "")
-                content_delta = delta.get("content", "")
+                struct_reasoning = delta.get("reasoning_content") or ""
+                content_delta = delta.get("content") or ""
                 tool_calls_delta = delta.get("tool_calls")
 
-                # Handle structured reasoning_content field from TabbyAPI
-                if reasoning_delta and settings.enable_anthropic_thinking_blocks:
+                # Handle structured reasoning_content field (llama-server separate thinking)
+                if struct_reasoning and settings.enable_anthropic_thinking_blocks:
                     if not thinking_block_started:
                         yield anthropic_formatter.format_content_block_start(content_block_index, "thinking")
                         thinking_block_started = True
                     yield anthropic_formatter.format_content_block_delta(
                         content_block_index,
-                        reasoning_delta,
+                        struct_reasoning,
                         delta_type="thinking_delta",
                     )
 
+                # Route content through StreamingParser to extract inline <think> blocks
                 if content_delta:
-                    # Close thinking block if we're starting content
-                    if thinking_block_started and settings.enable_anthropic_thinking_blocks:
-                        yield anthropic_formatter.format_content_block_stop(content_block_index)
-                        content_block_index += 1
-                        thinking_block_started = False
+                    parsed = streaming_parser.process_chunk(content_delta)
+                    if parsed:
+                        # Use inline reasoning only when reasoning_content is not already present
+                        inline_reasoning = parsed.get("reasoning_delta") if not struct_reasoning else None
+                        visible_content = parsed.get("content_delta")
 
-                    # Start text block if not started
-                    if not content_block_started:
-                        yield anthropic_formatter.format_content_block_start(content_block_index, "text")
-                        content_block_started = True
+                        if inline_reasoning and settings.enable_anthropic_thinking_blocks:
+                            if not thinking_block_started:
+                                yield anthropic_formatter.format_content_block_start(content_block_index, "thinking")
+                                thinking_block_started = True
+                            yield anthropic_formatter.format_content_block_delta(
+                                content_block_index,
+                                inline_reasoning,
+                                delta_type="thinking_delta",
+                            )
 
-                    # Send content delta
-                    yield anthropic_formatter.format_content_block_delta(
-                        content_block_index,
-                        content_delta,
-                        delta_type="text_delta"
-                    )
-                    text_emitted = True
+                        if visible_content:
+                            if thinking_block_started and settings.enable_anthropic_thinking_blocks:
+                                yield anthropic_formatter.format_content_block_stop(content_block_index)
+                                content_block_index += 1
+                                thinking_block_started = False
+                            if not content_block_started:
+                                yield anthropic_formatter.format_content_block_start(content_block_index, "text")
+                                content_block_started = True
+                            yield anthropic_formatter.format_content_block_delta(
+                                content_block_index,
+                                visible_content,
+                                delta_type="text_delta"
+                            )
+                            text_emitted = True
 
                 # Handle tool calls
                 if tool_calls_delta:
@@ -1330,61 +1363,6 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                             if "arguments" in fn:
                                 logger.debug(f"Adding arguments: '{fn['arguments']}' to tool {captured_tool_calls[idx]['function']['name']}")
                                 captured_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-
-                # OLD PARSER-BASED LOGIC (keeping for fallback)
-                if content_delta and False:  # Disabled
-                    # Process with streaming parser to preserve <think> blocks
-                    # Note: Parser will handle prepending <think> tag when it detects </think>
-                    parsed = streaming_parser.process_chunk(content_delta)
-
-                    if parsed:
-                        reasoning_delta = parsed.get("reasoning_delta")
-                        if reasoning_delta and settings.enable_anthropic_thinking_blocks:
-                            if not thinking_block_started:
-                                yield anthropic_formatter.format_content_block_start(content_block_index, "thinking")
-                                thinking_block_started = True
-                            yield anthropic_formatter.format_content_block_delta(
-                                content_block_index,
-                                reasoning_delta,
-                                delta_type="thinking_delta",
-                            )
-
-                        if parsed["type"] == "content":
-                            # Start text block if not started
-                            if not content_block_started:
-                                if thinking_block_started and settings.enable_anthropic_thinking_blocks:
-                                    yield anthropic_formatter.format_content_block_stop(content_block_index)
-                                    content_block_index += 1
-                                    thinking_block_started = False
-                                yield anthropic_formatter.format_content_block_start(content_block_index, "text")
-                                content_block_started = True
-
-                            delta_payload = parsed.get("raw_delta") if not settings.enable_anthropic_thinking_blocks else parsed.get("content_delta")
-                            if delta_payload:
-                                yield anthropic_formatter.format_content_block_delta(
-                                    content_block_index,
-                                    delta_payload,
-                                    delta_type="text_delta"
-                                )
-                                text_emitted = True
-
-                        elif parsed["type"] == "tool_calls":
-                            # Close text block if open
-                            if content_block_started:
-                                yield anthropic_formatter.format_content_block_stop(content_block_index)
-                                content_block_index += 1
-                                content_block_started = False
-                            if thinking_block_started:
-                                yield anthropic_formatter.format_content_block_stop(content_block_index)
-                                content_block_index += 1
-                                thinking_block_started = False
-
-                            # Send tool use blocks
-                            captured_tool_calls = parsed["tool_calls"]
-                            for tool_call in parsed["tool_calls"]:
-                                yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
-                                yield anthropic_formatter.format_content_block_stop(content_block_index)
-                                content_block_index += 1
 
                 # Check for finish
                 finish_reason = choice.get("finish_reason")
@@ -1426,18 +1404,46 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                     if finish_reason == "stop" and (captured_tool_calls or streaming_parser.has_tool_calls()):
                         finish_reason = "tool_calls"
 
-                    # Map finish reason
+                    # Map finish reason and defer message_delta until stream is drained for usage
                     stop_reason = "end_turn" if finish_reason == "stop" else finish_reason
                     if finish_reason == "tool_calls":
                         stop_reason = "tool_use"
+                    pending_stop_reason = stop_reason
+                    # Don't break — keep draining for the usage-only chunk that follows
 
-                    yield anthropic_formatter.format_message_delta(stop_reason)
+        # Flush any content still buffered in the parser (e.g. thinking that never closed)
+        pending_tail = streaming_parser.flush_pending()
+        if pending_tail:
+            pending_reasoning = pending_tail.get("reasoning_delta")
+            pending_content = pending_tail.get("content_delta")
+            if pending_reasoning and settings.enable_anthropic_thinking_blocks:
+                if not thinking_block_started:
+                    yield anthropic_formatter.format_content_block_start(content_block_index, "thinking")
+                    thinking_block_started = True
+                yield anthropic_formatter.format_content_block_delta(
+                    content_block_index, pending_reasoning, delta_type="thinking_delta"
+                )
+            if pending_content:
+                if thinking_block_started and settings.enable_anthropic_thinking_blocks:
+                    yield anthropic_formatter.format_content_block_stop(content_block_index)
+                    content_block_index += 1
+                    thinking_block_started = False
+                if not content_block_started:
+                    yield anthropic_formatter.format_content_block_start(content_block_index, "text")
+                    content_block_started = True
+                yield anthropic_formatter.format_content_block_delta(
+                    content_block_index, pending_content, delta_type="text_delta"
+                )
+                text_emitted = True
 
-        # Send message_stop
+        # Close any unclosed blocks
         if thinking_block_started:
             yield anthropic_formatter.format_content_block_stop(content_block_index)
             thinking_block_started = False
 
+        logger.info(f"Anthropic stream complete: pending_stop_reason={pending_stop_reason}, backend_usage={backend_usage}")
+
+        # Emit fallback content block BEFORE message_delta to preserve event ordering
         if not text_emitted and not captured_tool_calls:
             yield anthropic_formatter.format_content_block_start(content_block_index, "text")
             yield anthropic_formatter.format_content_block_delta(
@@ -1446,6 +1452,23 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                 delta_type="text_delta",
             )
             yield anthropic_formatter.format_content_block_stop(content_block_index)
+
+        # Emit message_delta with real token counts now that the stream is drained
+        if pending_stop_reason is not None:
+            if backend_usage and "prompt_tokens" in backend_usage:
+                anthropic_usage: Optional[Dict[str, Any]] = {
+                    "input_tokens": backend_usage.get("prompt_tokens", 0),
+                    "output_tokens": backend_usage.get("completion_tokens", 0),
+                }
+            elif backend_usage:
+                anthropic_usage = {
+                    "input_tokens": backend_usage.get("input_tokens", 0),
+                    "output_tokens": backend_usage.get("output_tokens", 0),
+                }
+            else:
+                anthropic_usage = None
+            yield anthropic_formatter.format_message_delta(pending_stop_reason, usage=anthropic_usage)
+
         yield anthropic_formatter.format_message_stop()
 
         if session_id:
